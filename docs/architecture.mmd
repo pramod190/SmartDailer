@@ -1,0 +1,11 @@
+flowchart TD
+  Campaign --> Pacing[Predictive Pacing Engine]
+  Pacing --> Safety[Safety Controller]
+  Safety --> Allocator[Progressive Call Allocator]
+  Allocator --> DB[(PostgreSQL)]
+  Allocator --> Provider[TelecomProvider]
+  Provider --> A[Mock Provider A]
+  Provider --> B[Mock Provider B]
+  Provider --> Events[Provider Events]
+  Events --> Recovery[Recovery Worker]
+  Recovery --> DB

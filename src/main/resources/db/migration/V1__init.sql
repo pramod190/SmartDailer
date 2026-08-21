@@ -1,0 +1,13 @@
+CREATE TABLE IF NOT EXISTS campaigns (id VARCHAR(100) PRIMARY KEY, name VARCHAR(200) NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS agents (id UUID PRIMARY KEY, campaign_id VARCHAR(100) NOT NULL, state VARCHAR(20) NOT NULL, version BIGINT NOT NULL DEFAULT 0, lease_expires_at TIMESTAMPTZ);
+ALTER TABLE agents ADD CONSTRAINT fk_agents_campaign FOREIGN KEY (campaign_id) REFERENCES campaigns(id);
+CREATE INDEX IF NOT EXISTS idx_agents_available ON agents(campaign_id, state);
+CREATE TABLE IF NOT EXISTS borrowers (id VARCHAR(100) PRIMARY KEY, campaign_id VARCHAR(100) NOT NULL, reserved_at TIMESTAMPTZ);
+ALTER TABLE borrowers ADD CONSTRAINT fk_borrowers_campaign FOREIGN KEY (campaign_id) REFERENCES campaigns(id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_borrowers_active ON borrowers(id) WHERE reserved_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS calls (id UUID PRIMARY KEY, agent_id UUID NOT NULL REFERENCES agents(id), borrower_id VARCHAR(100) NOT NULL REFERENCES borrowers(id), state VARCHAR(20) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), version BIGINT NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_calls_active ON calls(state);
+CREATE TABLE IF NOT EXISTS provider_events (event_id VARCHAR(200) PRIMARY KEY, call_id UUID NOT NULL, event_type VARCHAR(20) NOT NULL, sequence_no BIGINT, received_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS provider_health (provider VARCHAR(100) PRIMARY KEY, health VARCHAR(20) NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS pacing_decisions (id UUID PRIMARY KEY, requested_calls INT NOT NULL, reason TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS safety_decisions (id UUID PRIMARY KEY, decision VARCHAR(30) NOT NULL, approved_calls INT NOT NULL, reason TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
