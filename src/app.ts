@@ -3,6 +3,8 @@
 // ============================================================================
 
 import express from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Database } from './infrastructure/database.js';
 import { createDatabase } from './infrastructure/database.js';
 import { runMigrations } from './infrastructure/migrations.js';
@@ -15,6 +17,9 @@ import { createBorrowersRouter } from './api/borrowers.js';
 import { createDialerRouter } from './api/dialer.js';
 import { createSimulationRouter } from './api/simulation.js';
 import { createMetricsRouter } from './api/metrics.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export interface AppDependencies {
   db?: Database;
@@ -54,6 +59,18 @@ export function createApp(deps: AppDependencies = {}): express.Application {
   app.use('/api', createDialerRouter(db, config, provider));
   app.use('/api/simulation', createSimulationRouter(db));
   app.use('/api', createMetricsRouter(db, config));
+
+  // --- Static Frontend ---
+  const publicDir = path.resolve(__dirname, '..', 'public');
+  app.use(express.static(publicDir));
+
+  // --- SPA fallback (serve index.html for non-API routes) ---
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) {
+      return next();
+    }
+    res.sendFile(path.join(publicDir, 'index.html'));
+  });
 
   // --- 404 Handler ---
   app.use((_req, res) => {

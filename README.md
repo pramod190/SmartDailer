@@ -1,627 +1,514 @@
-# SmartDialer — Predictive Outbound Pacing with Deterministic Safety
+# SmartDialer
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-24+-green.svg)](https://nodejs.org/)
-[![Tests](https://img.shields.io/badge/Tests-218%20Passing-brightgreen.svg)]()
-[![Invariants](https://img.shields.io/badge/Invariants-100%25%20Verified-success.svg)]()
-[![Architecture](https://img.shields.io/badge/Architecture-Distributed%20Worker%20Ready-orange.svg)]()
+## 1. Project Overview
 
-> **SmartDialer** is a mission-critical, production-grade outbound call pacing engine designed to **maximize agent utilization through predictive overdialing while deterministically preventing abandoned calls and double-reservations**.
+SmartDialer is a **predictive and progressive outbound dialing platform** designed for call-center environments — particularly debt collection, telemarketing, and customer outreach campaigns. The system solves the core problem of **agent utilization**: in a naive setup, agents spend significant time waiting for calls to connect, listening to ringing, or handling busy/no-answer lines. SmartDialer automatically paces outbound calls so that when an agent finishes one call, another connected borrower is already waiting.
 
-Built specifically for high-volume collection and debt recovery platforms, SmartDialer solves the classic dilemma between **agent idle time** and **customer abandonment**. It enforces strict distributed systems invariants: no agent is ever double-booked, every call terminates cleanly, and out-of-order, duplicate, or delayed telecom provider events are safely reconciled.
+### The Problem It Solves
 
----
+- **Agent idle time**: Without predictive dialing, agents waste 40-60% of their time dialing and waiting for connections.
+- **Overdial safety**: Predictive dialing risks abandoned calls (borrower answers but no agent is free), which is regulated by the FCC (3% max abandon rate).
+- **Concurrency safety**: Multiple workers can run dialer ticks simultaneously without double-allocating agents or borrowers.
+- **Provider reliability**: Telecom providers fail, timeout, and send duplicate/out-of-order events. The system handles all of these gracefully.
 
-## Table of Contents
+### Main Purpose
 
-1. [Architectural Highlights](#architectural-highlights)
-2. [Core Principles & Invariants](#core-principles--invariants)
-3. [Step-by-Step Workflow](#step-by-step-workflow)
-4. [System Architecture](#system-architecture)
-5. [Pacing Engines & Mathematical Models](#pacing-engines--mathematical-models)
-6. [Concurrency & Storage Architecture](#concurrency--storage-architecture)
-7. [Three-Layer Event Ingestion Pipeline](#three-layer-event-ingestion-pipeline)
-8. [Self-Healing & Resilience Subsystems](#self-healing--resilience-subsystems)
-9. [Finite State Machines (FSM)](#finite-state-machines-fsm)
-10. [REST API Documentation](#rest-api-documentation)
-11. [Simulation & Benchmarks (Scenarios A–D)](#simulation--benchmarks-scenarios-ad)
-12. [Performance & Load Testing](#performance--load-testing)
-13. [Getting Started & Installation](#getting-started--installation)
-14. [Documentation Directory](#documentation-directory)
+Provide a production-grade dialing platform that:
+- Guarantees calls placed never exceed safely allocated agents
+- Enforces regulatory abandon rate limits
+- Recovers automatically from worker crashes and stale reservations
+- Tracks provider health and degrades gracefully
 
----
+### Who Can Use It
 
-## Architectural Highlights
+- Call center operators managing outbound campaigns
+- Collection agencies dialing borrower phone numbers
+- Telemarketing teams running high-volume outreach
+- Developers building or studying predictive dialing systems
 
-- **Deterministic Safety Guarantee**: Pacing algorithms calculate statistical call targets, but an independent **Safety Controller** holds absolute veto power based on real-time agent availability, abandonment limits, and provider health. Pacing *proposes*; Safety *disposes*.
-- **Atomic Optimistic Concurrency Control (OCC)**: Version-checked state transitions (`UPDATE ... WHERE version = ?`) ensure that multiple concurrent dialer workers can never double-reserve an agent or allocate the same borrower twice.
-- **Strict Distributed Boundary Separation**: Database transactions handle entity reservations, but external telecom RPCs occur strictly *outside* database transactions. Network failures and timeouts trigger explicit transactional compensations.
-- **Three-Layer Event Ingestion**: Carrier webhooks pass through:
-  1. *Idempotency Guard* (duplicate deduplication via database event ledger),
-  2. *Ordering Guard* (sequence counters rejecting stale out-of-order packets),
-  3. *State Machine Validation* (strict transition rule enforcement).
-- **Automated Outage & Stale Recovery**: Background lease reapers reclaim orphaned reservations caused by worker crashes; provider circuit breakers automatically fall back to conservative progressive pacing during telecom instability.
-- **PostgreSQL Ready**: Designed with standard SQL schemas, explicit version columns, and foreign key integrity ready for multi-node deployment.
+### Main Features
+
+- **Two dialing modes**: Progressive (1:1, safe) and Predictive (overdial for efficiency)
+- **Safety Controller**: Independent veto power over dialing decisions
+- **State machines**: Explicit agent and call state machines with validated transitions
+- **Optimistic locking**: All mutable entities use version-based concurrency control
+- **Provider event processing**: Idempotent, ordered, and state-machine-protected
+- **Stale reservation recovery**: Automatic reclamation of abandoned resources
+- **Provider health tracking**: Real-time health status (HEALTHY/DEGRADED/UNHEALTHY)
+- **Simulation & benchmarking**: Built-in scenarios comparing progressive vs. predictive
+- **Web dashboard**: Full-featured web UI for managing all operations
 
 ---
 
-## Core Principles & Invariants
+## 2. Existing Console Application
+
+The original application is a **console/CLI-based system** with the following workflows:
+
+### Console Workflows
+
+1. **Start the server**: `npm run start` or `npm run dev` — starts the Express API server on port 3000.
+2. **Run simulations**: `npm run simulate` — runs all benchmark scenarios via `src/simulation/run.ts`, comparing progressive vs. predictive dialing with formatted console output.
+3. **Run load tests**: `npm run loadtest` — runs load testing via `src/loadtest/run.ts`.
+4. **Run tests**: `npm test`, `npm run test:unit`, `npm run test:integration`, `npm run test:concurrency` — comprehensive test suites.
+5. **API interaction**: The Express server exposes REST API endpoints for all operations (campaigns, agents, borrowers, dialer, simulation, metrics).
+
+### How Console Workflows Map to the Web UI
+
+| Console Workflow | Web UI Equivalent |
+|---|---|
+| `npm run simulate` (run scenarios) | Simulation page — run scenarios with visual comparison tables |
+| `POST /api/campaigns` (curl/HTTP) | Campaigns page — "New Campaign" button with form modal |
+| `POST /api/campaigns/:id/tick` (curl/HTTP) | Dialer Control page — "Run Tick" form with results display |
+| `POST /api/events` (webhook) | Dialer Control page — "Process Provider Event" form |
+| `GET /api/campaigns/:id/metrics` | Dashboard & Campaign Detail — auto-fetched stat cards |
+| `POST /api/recovery/stale` | Recovery page — "Run Recovery" form with summary |
+| `GET /api/providers/health` | Provider Health page — health table with status badges |
+
+---
+
+## 3. New Web Application
+
+### Why the Web UI Was Added
+
+The original system was accessible only via HTTP API calls (curl, Postman) or CLI scripts. The web UI provides a **visual, interactive interface** that makes all functionality accessible to operators without technical knowledge.
+
+### Main Pages
+
+1. **Dashboard** — Overview of all campaigns, agents, borrowers, calls, and provider health with summary stat cards and recent activity tables.
+2. **Campaigns** — List all campaigns with status management. Click any campaign to see its detail page with tabs for agents, borrowers, calls, and config.
+3. **Campaign Detail** — Tabbed view showing agents, borrowers, calls, and configuration for a specific campaign. Includes "Run Tick" button and inline status changes.
+4. **Agents** — All agents across all campaigns with state breakdown, state transition controls, and heartbeat functionality.
+5. **Borrowers** — All borrowers across campaigns with status filtering, priority display, and add functionality.
+6. **Calls** — All calls placed by the dialer with state breakdown and detailed information including failure reasons.
+7. **Dialer Control** — Manual dialer tick triggering with mode override, plus provider event submission (webhook simulation).
+8. **Simulation** — Run benchmark scenarios comparing progressive vs. predictive dialing, or run custom simulations with configurable parameters.
+9. **Provider Health** — Telecom provider health metrics including success/failure counts, latency, and health status.
+10. **Recovery** — Trigger stale reservation recovery to reclaim abandoned agent reservations and fail stuck calls.
+11. **Settings** — System status and configuration overview.
+
+### Sidebar Navigation
+
+The left sidebar provides navigation to all pages with active state highlighting, a brand logo, and a system status indicator at the bottom.
+
+### Dashboard
+
+The dashboard fetches real data from the API:
+- **Stat cards**: Total campaigns, active campaigns, total agents, total borrowers, completed calls, failed calls, provider count
+- **Recent campaigns table**: Last 5 campaigns with clickable rows
+- **Provider health table**: All providers with health status
+
+### Forms
+
+- **Create Campaign**: Modal form with name, mode (progressive/predictive), target abandonment rate, and max concurrency.
+- **Add Agents**: Modal form with initial state and count (batch creation).
+- **Add Borrower**: Modal form with phone number and priority.
+- **Agent State Transition**: Modal showing valid target states based on the state machine.
+- **Dialer Tick**: Form with campaign selector and optional mode override.
+- **Provider Event**: Form for submitting webhook events (eventId, providerCallId, eventType, sequenceNumber).
+- **Custom Simulation**: Full form with mode, provider type, agent/borrower/tick counts, answer rate, failure rate, and seed.
+- **Recovery**: Form with optional campaign selector.
+
+### Tables
+
+All tables are sortable, responsive, and include:
+- Status badges with color coding
+- Truncated UUIDs for readability
+- Formatted timestamps
+- Empty states with helpful messages
+- Clickable rows for navigation (campaigns)
+- Inline action buttons (state transitions, heartbeats)
+
+### Backend Integration
+
+The web UI connects directly to the existing Express API. No new backend code was added except:
+- Static file serving (`express.static`) in `app.ts`
+- SPA fallback route for client-side routing
+
+All business logic remains in the existing services, repositories, and domain models.
+
+---
+
+## 4. Features
+
+### Campaign Management
+- Create campaigns with progressive or predictive dialing mode
+- Change campaign status (created → active → paused → completed → cancelled)
+- View campaign configuration (target abandonment rate, max concurrency, etc.)
+- Per-campaign metrics: agent breakdown, call counts, borrower status distribution, abandonment rate
+
+### Agent Management
+- Create agents individually or in batch (up to 100 at once)
+- State machine with 7 states: OFFLINE, AVAILABLE, RESERVED, DIALING, CONNECTED, WRAP_UP, PAUSED
+- Validated state transitions — only allowed transitions are offered in the UI
+- Optimistic locking prevents concurrent state conflicts
+- Heartbeat mechanism for agent liveness tracking
+- Stale reservation detection and recovery
+
+### Borrower Management
+- Add borrowers with phone number and priority (0-10, higher = more urgent)
+- Deterministic selection algorithm: highest priority → oldest last attempt → stable ID tie-breaker
+- Retry with exponential backoff after call failures
+- Borrower statuses: eligible, allocated, completed, exhausted, do_not_call, invalid_number
+- Maximum retry attempts (default: 3) before exhaustion
+
+### Call Lifecycle
+- 9-state call state machine: QUEUED → RESERVED → INITIATED → RINGING → ANSWERED → CONNECTED → COMPLETED/FAILED/CANCELLED
+- Terminal state protection — completed/failed/cancelled calls never revert
+- Event ordering protection via sequence numbers
+- Idempotent event processing via unique (provider, eventId) constraint
+- Full audit trail with timestamps at each lifecycle stage
+
+### Dialer Control
+- **Progressive mode**: Calls = available agents - safety buffer. No overdial. Conservative.
+- **Predictive mode**: Calls = available agents / predicted answer rate. Overdial capped by Safety Controller.
+- Manual tick triggering via web UI
+- Automatic provider event draining for mock providers
+
+### Safety Controller
+- Independent veto power over dialing decisions
+- Enforces max overdial ratio (1.5x default)
+- Enforces max abandon rate (3% regulatory limit)
+- Blocks dialing when provider is UNHEALTHY
+- Reduces calls by 50% when provider is DEGRADED
+- Pure function: (system_state, proposed_calls) → approved_calls
+
+### Provider Event Processing
+- Three-layer protection: Idempotency → Event Ordering → State Machine
+- Handles duplicate events (same eventId processed twice)
+- Handles out-of-order events (sequence number comparison)
+- Handles backward transitions (state machine rejects)
+- Side effects: agent state transitions, borrower completion/release, provider health recording
+
+### Stale Reservation Recovery
+- Detects agents stuck in RESERVED state beyond lease timeout (60s default)
+- Reclaims agents back to AVAILABLE
+- Fails associated calls with "stale_reservation_timeout"
+- Releases or exhausts associated borrowers
+- Uses optimistic locking to prevent race conditions
+
+### Provider Health Tracking
+- Tracks total/successful/failed/timed-out calls per provider
+- Calculates health status: HEALTHY → DEGRADED (3+ consecutive failures) → UNHEALTHY (10+ consecutive failures)
+- Records last failure and success timestamps
+- Used by Safety Controller for dialing decisions
+
+### Simulation & Benchmarking
+- 4 predefined benchmark scenarios:
+  - **Scenario A**: Low answer rate (20%) — tests predictive pacing keeping agents busy
+  - **Scenario B**: Medium answer rate (50%) — typical production environment
+  - **Scenario C**: High answer rate (70%) — safety stress test for overdial clamping
+  - **Scenario D**: Unreliable provider — network stress with timeouts, dropped calls, out-of-order events
+- Custom simulation with configurable parameters
+- Side-by-side comparison of progressive vs. predictive results
+- Invariant verification: no double reservation, all calls terminal, no orphaned agents
+- Tick-by-tick metrics breakdown
+
+---
+
+## 5. Technology Stack
+
+| Technology | Usage |
+|---|---|
+| **TypeScript** | Primary language for all backend code |
+| **Node.js** | Runtime (uses built-in `node:sqlite` module) |
+| **Express** | Web framework / API server |
+| **SQLite** | Database (via `node:sqlite`, WAL mode, zero external DB dependencies) |
+| **UUID** | ID generation (`uuid` v10) |
+| **Vitest** | Test framework |
+| **TSX** | TypeScript execution for development |
+| **HTML/CSS/JavaScript** | Frontend (vanilla, no framework — single-page application) |
+| **Inter Font** | Web font (Google Fonts) |
+
+---
+
+## 6. Project Structure
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        CORE SYSTEM INVARIANTS                          │
-├────────────────────────────────────────────────────────────────────────┤
-│ 1. Agent Exclusivity  : Exactly 0 or 1 active call per agent at all    │
-│                         times. Double-booking is physically impossible.│
-│ 2. Guaranteed Clean-up: Every call reaches a terminal state            │
-│                         (COMPLETED, FAILED, CANCELLED). No zombies.    │
-│ 3. Strict Veto Power  : Safety Controller approval is non-bypassable.  │
-│ 4. Deterministic Leases: Reservations expire automatically via TTL     │
-│                         and are reaped if unconfirmed.                 │
-│ 5. Event Idempotency  : Replaying the same webhook 100 times produces  │
-│                         the exact same internal state.                 │
-└────────────────────────────────────────────────────────────────────────┘
+SmartDailer/
+├── src/
+│   ├── allocation/
+│   │   └── CallAllocator.ts          # Atomic agent+borrower+call allocation
+│   ├── api/                          # Express API routers (controllers)
+│   │   ├── agents.ts                 # Agent CRUD + state transitions
+│   │   ├── borrowers.ts             # Borrower CRUD + batch creation
+│   │   ├── campaigns.ts             # Campaign CRUD + status management
+│   │   ├── dialer.ts                 # Dialer tick + event processing
+│   │   ├── metrics.ts               # Campaign metrics + provider health + recovery
+│   │   └── simulation.ts            # Scenario running + custom simulation
+│   ├── common/
+│   │   └── logger.ts                 # Structured logging
+│   ├── config.ts                     # Centralized configuration (env vars + defaults)
+│   ├── domain/                       # Domain models + repositories
+│   │   ├── agent/
+│   │   │   ├── AgentRepository.ts    # Agent DB operations + optimistic locking
+│   │   │   └── AgentState.ts         # Agent model + state machine
+│   │   ├── borrower/
+│   │   │   ├── Borrower.ts           # Borrower model + statuses
+│   │   │   └── BorrowerRepository.ts # Borrower DB ops + deterministic selection
+│   │   ├── call/
+│   │   │   ├── CallRepository.ts     # Call DB ops + state transitions
+│   │   │   └── CallState.ts          # Call model + state machine
+│   │   ├── campaign/
+│   │   │   ├── Campaign.ts           # Campaign model + config
+│   │   │   └── CampaignRepository.ts # Campaign DB operations
+│   │   └── provider/
+│   │       ├── ProviderHealth.ts     # Provider health model
+│   │       └── ProviderHealthRepository.ts # Provider health DB ops
+│   ├── events/
+│   │   └── ProviderEventHandler.ts   # 3-layer event processing pipeline
+│   ├── infrastructure/
+│   │   ├── database.ts               # SQLite setup + transaction helper
+│   │   ├── migrations.ts            # Migration runner
+│   │   └── migrations/
+│   │       └── 001_initial_schema.sql # Full database schema
+│   ├── loadtest/
+│   │   ├── LoadTest.ts               # Load testing framework
+│   │   ├── run.ts                    # Load test entry point
+│   │   └── runLoadTest.ts           # Load test runner
+│   ├── pacing/
+│   │   ├── PredictiveDialer.ts       # Predictive pacing algorithm
+│   │   └── ProgressiveDialer.ts       # Progressive pacing algorithm
+│   ├── provider/
+│   │   ├── ReliableMockProvider.ts   # Mock provider (reliable)
+│   │   ├── TelecomProvider.ts        # Provider interface
+│   │   └── UnreliableMockProvider.ts # Mock provider (unreliable)
+│   ├── recovery/
+│   │   └── StaleReservationRecovery.ts # Stale reservation reclamation
+│   ├── safety/
+│   │   └── SafetyController.ts       # Independent safety gate with veto power
+│   ├── simulation/
+│   │   ├── SimulationRunner.ts       # Multi-tick simulation engine
+│   │   ├── run.ts                    # Simulation entry point
+│   │   ├── runScenarios.ts          # Scenario runner
+│   │   └── scenarios.ts             # Benchmark scenario definitions
+│   ├── app.ts                        # Express app setup + static file serving
+│   └── server.ts                     # Server entry point
+├── public/                           # Frontend web UI
+│   ├── app.js                        # SPA application logic
+│   ├── index.html                    # HTML shell
+│   └── styles.css                    # Stylesheet
+├── tests/                            # Test suites
+│   ├── concurrency/                  # Concurrency safety tests
+│   ├── helpers/
+│   │   └── testDb.ts                 # Test database helper
+│   ├── integration/                  # Integration tests
+│   ├── simulation/                   # Simulation tests
+│   └── unit/                         # Unit tests (state machines)
+├── docs/                             # Documentation
+├── package.json
+├── tsconfig.json
+├── vitest.config.ts
+└── README.md
 ```
+
+### Key Directory Responsibilities
+
+- **`src/api/`** — Express routers that handle HTTP requests and responses. These are the controllers.
+- **`src/domain/`** — Business logic: models, state machines, and repositories (data access layer).
+- **`src/pacing/`** — Dialing algorithms (progressive and predictive).
+- **`src/safety/`** — Safety Controller with veto power over dialing decisions.
+- **`src/allocation/`** — Atomic allocation of agents, borrowers, and calls.
+- **`src/events/`** — Provider event processing pipeline with idempotency and ordering.
+- **`src/recovery/`** — Stale reservation recovery.
+- **`src/infrastructure/`** — Database setup, migrations, and schema.
+- **`src/simulation/`** — Simulation engine and benchmark scenarios.
+- **`public/`** — Frontend web UI (vanilla HTML/CSS/JS SPA).
+- **`tests/`** — Unit, integration, concurrency, and simulation tests.
 
 ---
 
-## Step-by-Step Workflow
+## 7. Architecture
 
-Here is how a dialer cycle executes from campaign ingestion to call termination:
+SmartDialer follows a **layered architecture** with clear separation of concerns:
+
+```
+Web UI (public/)
+    ↓ HTTP/Fetch
+Controller / API Layer (src/api/)
+    ↓
+Service / Domain Layer (src/pacing/, src/safety/, src/allocation/, src/events/, src/recovery/)
+    ↓
+Repository / Data Access Layer (src/domain/*/Repository.ts)
+    ↓
+Database (SQLite via node:sqlite)
+```
+
+### Layer Details
+
+1. **Web UI** (`public/`): Vanilla JavaScript SPA that makes fetch() calls to the API. No business logic in the frontend — all validation and rules are enforced server-side.
+
+2. **Controller / API Layer** (`src/api/`): Express routers that parse HTTP requests, call the appropriate services/repositories, and return JSON responses. Thin controllers — no business logic here.
+
+3. **Service Layer**:
+   - **ProgressiveDialer / PredictiveDialer** (`src/pacing/`): Implement the two dialing strategies. Each tick: count available agents → calculate capacity → allocate calls via CallAllocator → initiate via provider.
+   - **SafetyController** (`src/safety/`): Pure function that assesses proposed calls against system state. Has veto power — can reduce or reject calls proposed by the dialer.
+   - **CallAllocator** (`src/allocation/`): Atomic sequence: reserve agent → allocate borrower → create call → initiate via provider. Uses database transactions for steps 1-3, provider call happens outside the transaction.
+   - **ProviderEventHandler** (`src/events/`): Three-layer event processing: idempotency check → sequence ordering → state machine validation → side effects (agent/borrower state changes, health recording).
+   - **StaleReservationRecovery** (`src/recovery/`): Scans for agents stuck in RESERVED state beyond lease timeout, reclaims them, fails associated calls, releases borrowers.
+
+4. **Repository Layer** (`src/domain/*/Repository.ts`): Direct database operations using prepared statements. All mutations use optimistic locking via version columns. No business logic — just CRUD + specialized queries.
+
+5. **Database** (SQLite): WAL mode for concurrent readers + single writer. Foreign keys enforced. CHECK constraints on all state columns. Indexes optimized for the hot paths (agent reservation, borrower selection, active call lookup, event deduplication).
+
+### Key Design Decisions
+
+- **Optimistic Locking**: Every mutable entity has a `version` column. Updates use `WHERE id = ? AND version = ?` — if another worker modified the row first, the update affects 0 rows and the operation fails gracefully.
+- **State Machines**: Both agents and calls have explicit state machines with validated transitions. Invalid transitions are rejected — the system never allows arbitrary state mutations.
+- **Terminal State Protection**: Once a call reaches COMPLETED, FAILED, or CANCELLED, it can never transition back. This is the primary defense against out-of-order events.
+- **Transaction Boundary**: Database operations (agent reservation, borrower allocation, call creation) happen inside a transaction. The external provider call happens outside — this is the fundamental distributed systems boundary.
+- **Safety Controller Independence**: The Safety Controller is a pure function with veto power. It never mutates state. It reads system state and advises how many calls are safe to place.
+
+---
+
+## 8. Architecture Diagram
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant D as Dialer Worker (Tick)
-    participant PE as Pacing Engine
-    participant SC as Safety Controller
-    participant CA as Call Allocator (DB)
-    participant TP as Telecom Provider
-    participant EP as Event Pipeline
+flowchart TD
+    UI[Web UI — public/]
+    API[API Layer — src/api/]
+    Progressive[ProgressiveDialer]
+    Predictive[PredictiveDialer]
+    Safety[SafetyController<br/>Veto Power]
+    Allocator[CallAllocator<br/>Atomic Allocation]
+    EventHandler[ProviderEventHandler<br/>Idempotency + Ordering]
+    Recovery[StaleReservationRecovery]
+    AgentRepo[AgentRepository]
+    BorrowerRepo[BorrowerRepository]
+    CallRepo[CallRepository]
+    CampaignRepo[CampaignRepository]
+    HealthRepo[ProviderHealthRepository]
+    Provider[TelecomProvider<br/>Mock/Real]
+    DB[(SQLite<br/>WAL Mode)]
 
-    Note over D,PE: Phase 1 & 2: Evaluation & Pacing
-    D->>PE: computeDesiredCalls(campaignId)
-    PE->>PE: Calculate raw dial count (Progressive or Predictive)
-    PE->>D: DialRequest { desiredCalls, predictedPicks }
+    UI -->|HTTP/Fetch| API
+    API --> Progressive
+    API --> Predictive
+    API --> EventHandler
+    API --> Recovery
+    API --> CampaignRepo
+    API --> AgentRepo
+    API --> BorrowerRepo
+    API --> CallRepo
+    API --> HealthRepo
 
-    Note over D,SC: Phase 3: Deterministic Safety Validation
-    D->>SC: evaluateSafety(DialRequest, liveMetrics)
-    SC->>SC: Check headroom, abandonment rate & circuit breaker
-    SC->>D: ApprovedCalls (clamped or rejected)
+    Progressive --> Allocator
+    Predictive --> Safety
+    Safety -->|approved calls| Allocator
+    Allocator -->|reserve| AgentRepo
+    Allocator -->|allocate| BorrowerRepo
+    Allocator -->|create| CallRepo
+    Allocator -->|initiateCall| Provider
+    Provider -->|events| EventHandler
+    EventHandler --> CallRepo
+    EventHandler --> AgentRepo
+    EventHandler --> BorrowerRepo
+    EventHandler --> HealthRepo
+    Recovery --> AgentRepo
+    Recovery --> CallRepo
+    Recovery --> BorrowerRepo
 
-    Note over D,CA: Phase 4: Atomic Reservation (DB OCC)
-    D->>CA: allocateBatch(ApprovedCalls)
-    loop For Each Approved Call
-        CA->>CA: Find eligible borrower (status='PENDING')
-        CA->>CA: Find available agent (status='AVAILABLE')
-        CA->>CA: UPDATE agent SET status='RESERVED', version=v+1 WHERE version=v
-        CA->>CA: UPDATE borrower SET status='ALLOCATED', version=v+1 WHERE version=v
-        CA->>CA: INSERT INTO calls (status='RESERVED')
-    end
-    CA-->>D: AllocationResult (Allocated Calls + Agent Leases)
-
-    Note over D,TP: Phase 5: Provider Dispatch (Outside DB Tx)
-    loop For Each Allocated Call
-        D->>TP: initiateCall(borrowerPhone, agentId)
-        alt RPC Succeeded
-            TP-->>D: providerCallId
-            D->>CA: confirmInitiated(callId, providerCallId)
-        else RPC Failed / Timed out
-            TP--xD: Error / Timeout
-            D->>CA: rollbackAllocation(callId, agentId, borrowerId)
-        end
-    end
-
-    Note over TP,EP: Phase 6: Webhook Processing
-    TP->>EP: Webhook: { providerCallId, eventType, sequenceNumber }
-    EP->>EP: 1. Idempotency Check (processed_events table)
-    EP->>EP: 2. Sequence Check (reject if seq < current_seq)
-    EP->>EP: 3. FSM Transition (Call & Agent State Machines)
-    EP->>CA: Apply atomic status update
-```
-
-### Detailed Execution Phases
-
-#### Phase 1: Campaign Configuration & Queue Provisioning
-- Campaign is established with pacing mode (`progressive` or `predictive`), max concurrent calls, and target abandonment ceiling ($\le 3\%$).
-- Agents are registered and transition to `AVAILABLE`.
-- Borrower lead lists are bulk ingested into the queue with priority scores and retry attempt limits.
-
-#### Phase 2: Pacing Evaluation Tick
-- Triggered on a periodic cadence (e.g., every 1,000ms) or on agent state transition.
-- **Progressive Mode**: Computes desired calls strictly 1:1 based on $N_{\text{available}} - \text{buffer}$.
-- **Predictive Mode**: Computes historical rolling answer rate ($R_{\text{answer}}$) and active ringing calls, calculating overdial volume needed to land an answer just as an agent finishes wrap-up.
-
-#### Phase 3: Independent Safety Controller Veto
-- Pacing proposals are forwarded to the Safety Controller.
-- The Safety Controller performs **three non-bypassable checks**:
-  1. **Agent Headroom**: Ensures active + pending calls do not exceed available agents plus allowed overdial margin.
-  2. **Abandonment Rate Clamp**: If the rolling 1-hour abandonment rate approaches 3%, overdialing is throttled. If $>3\%$, it immediately degrades predictive mode to 1:1 progressive dialing.
-  3. **Provider Circuit Breaker**: If telecom provider latency or error rates spike, dial approvals are throttled to 0 or 1 until the circuit resets.
-
-#### Phase 4: Atomic Reservation via Optimistic Concurrency Control (OCC)
-- Database transaction selects eligible borrowers (`SELECT ... WHERE status = 'PENDING' LIMIT N`).
-- Atomically reserves each agent using version checking:
-  ```sql
-  UPDATE agents 
-  SET status = 'RESERVED', reservation_expires_at = datetime('now', '+30 seconds'), version = version + 1
-  WHERE id = ? AND version = ? AND status = 'AVAILABLE';
-  ```
-- If an agent was snatched by another worker, the row count is 0; the allocator cleanly backs off without deadlocking.
-
-#### Phase 5: External Telecom RPC Dispatch
-- **Crucial Rule**: External HTTP/gRPC calls to telecom providers take place **strictly outside** database transactions. Holding DB transactions open during external network I/O exhausts connection pools.
-- If the provider responds successfully, call transitions to `INITIATED`.
-- If the provider times out or throws an error, a **compensation transaction** runs immediately: the agent reverts to `AVAILABLE`, the borrower attempt count increments, and the call is marked `FAILED`.
-
-#### Phase 6: Unreliable Webhook Ingestion
-- Carrier sends status callbacks: `RINGING`, `ANSWERED`, `CONNECTED`, `COMPLETED`, `FAILED`.
-- Webhooks pass through the **Three-Layer Event Ingestion Pipeline** (Deduplication $\to$ Ordering $\to$ State Machine).
-- When a call connects, agent transitions `RESERVED` $\to$ `DIALING` $\to$ `CONNECTED`.
-- When completed, agent transitions `CONNECTED` $\to$ `WRAP_UP` $\to$ `AVAILABLE`.
-
-#### Phase 7: Automated Self-Healing & Reconciliation
-- The **Stale Reservation Recovery** background task scans for agents stuck in `RESERVED` longer than the 30-second TTL (e.g., worker died before initiating call).
-- It marks orphaned calls as `FAILED` and restores the agent to `AVAILABLE`.
-- The **Provider Outage Handler** monitors consecutive errors and opens the circuit if threshold is exceeded.
-
----
-
-## System Architecture
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                              API LAYER                                 │
-│  Campaigns  │  Agents  │  Borrowers  │  Dialer  │  Events  │  Metrics  │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│                             DOMAIN LAYER                               │
-│  ┌───────────────────────┐                  ┌───────────────────────┐  │
-│  │     Pacing Engine     │                  │   Safety Controller   │  │
-│  │ (Progressive/Predict) │                  │  (Independent Veto)   │  │
-│  └───────────┬───────────┘                  └───────────▲───────────┘  │
-│              │ Proposes DialRequest                     │ Real-time     │
-│              └──────────────────────────────────────────┘ Validation   │
-│                                   │                                    │
-│  ┌────────────────────────────────▼─────────────────────────────────┐  │
-│  │                 Call Allocator (Batch & OCC)                     │  │
-│  │    - Agent Reservation      - Borrower Reservation               │  │
-│  │    - State Compensation     - Boundary Isolation                 │  │
-│  └────────────────────────────────┬─────────────────────────────────┘  │
-│                                   │                                    │
-│  ┌────────────────────────────────▼─────────────────────────────────┐  │
-│  │              Three-Layer Event Ingestion Pipeline                │  │
-│  │  [Idempotency Guard] ──► [Ordering Guard] ──► [FSM Engine]       │  │
-│  └──────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│                        INFRASTRUCTURE LAYER                            │
-│  ┌───────────────────────────────┐   ┌──────────────────────────────┐  │
-│  │ SQLite WAL (node:sqlite)      │   │ Telecom Provider Interface   │  │
-│  │ Strict Schema & Linear Migr.  │   │ Reliable / Unreliable Mock   │  │
-│  └───────────────────────────────┘   └──────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────────┘
+    AgentRepo --> DB
+    BorrowerRepo --> DB
+    CallRepo --> DB
+    CampaignRepo --> DB
+    HealthRepo --> DB
 ```
 
 ---
 
-## Pacing Engines & Mathematical Models
-
-### 1. Progressive Pacing (1:1 Conservative)
-
-Guarantees an abandonment rate of **0%**. Never initiates more calls than there are immediately available agents.
-
-$$\text{ApprovedCalls} = \max\Big(0, \; N_{\text{available}} - N_{\text{ringing}} - \text{SafetyBuffer}\Big)$$
-
-- **Safety Buffer**: Configurable (default: 0).
-- **When used**: Default mode for low-headroom campaigns, regulated regions, or when the predictive dialer detects high provider failure rates.
-
-### 2. Predictive Pacing (Erlang-Inspired Overdialing)
-
-Predicts customer pick-up rates to launch calls in advance, keeping agent idle time near zero while preserving the $\le 3\%$ abandonment rate cap.
-
-$$\text{RawCalls} = \left\lceil \frac{N_{\text{available}} + N_{\text{clearing\_soon}}}{\max(R_{\text{answer}}, R_{\text{min}})} \right\rceil$$
-
-Where:
-- $N_{\text{available}}$ = Agents currently in `AVAILABLE` state.
-- $N_{\text{clearing\_soon}}$ = Agents in `CONNECTED` state whose call duration has exceeded average handling time ($AHT$).
-- $R_{\text{answer}}$ = Exponentially Weighted Moving Average (EWMA) or rolling window pick-up rate:
-  $$R_{\text{answer}} = \frac{\text{Answered Calls in Window}}{\text{Total Initiated Calls in Window}}$$
-- $R_{\text{min}}$ = Floor bound (default: 0.10) to prevent division by zero or infinite dialing.
-
-#### Dynamic Safety Clamping
-
-The Safety Controller applies dynamic dampening to the predictive proposal:
-
-$$\text{ApprovedCalls} = \min\Big(\text{RawCalls} - N_{\text{ringing}}, \; N_{\text{available}} \times M_{\text{max}}\Big)$$
-
-If the recent abandonment rate $A > 2.0\%$, the dialer applies quadratic dampening:
-
-$$M_{\text{dampened}} = M_{\text{max}} \times \left(1 - \frac{A - 0.02}{0.03 - 0.02}\right)$$
-
-If $A \ge 3.0\%$, $M_{\text{dampened}} = 1.0$ (instant fallback to progressive).
-
----
-
-## Concurrency & Storage Architecture
-
-### Optimistic Concurrency Control (OCC)
-
-Rather than using long-running table locks (`LOCK TABLE`) or distributed Redis mutexes that risk split-brain conditions, SmartDialer uses version columns on all mutable entities:
-
-```sql
--- Agents Table Definition
-CREATE TABLE agents (
-  id            TEXT PRIMARY KEY,
-  campaign_id   TEXT NOT NULL,
-  status        TEXT NOT NULL, -- OFFLINE, AVAILABLE, RESERVED, DIALING, CONNECTED, WRAP_UP, PAUSED
-  version       INTEGER NOT NULL DEFAULT 1,
-  reservation_expires_at TEXT,
-  updated_at    TEXT NOT NULL
-);
-```
-
-When reserving an agent:
-```typescript
-const result = db.prepare(`
-  UPDATE agents 
-  SET status = 'RESERVED',
-      reservation_expires_at = ?,
-      version = version + 1,
-      updated_at = datetime('now')
-  WHERE id = ? AND version = ? AND status = 'AVAILABLE'
-`).run(expiresAt, agentId, currentVersion);
-
-if (result.changes === 0) {
-  // Concurrency conflict: Another worker claimed this agent simultaneously.
-  // Back off cleanly and pick the next candidate.
-}
-```
-
-### Clean Boundary: DB Transaction vs. Network RPC
-
-```
-   IN-TRANSACTION (Microseconds)            OUTSIDE-TRANSACTION (Seconds)
-┌─────────────────────────────────┐        ┌─────────────────────────────┐
-│ 1. Verify agent is AVAILABLE    │        │ 4. HTTP POST to Telecom API │
-│ 2. Set agent to RESERVED (OCC)  │───────►│    (Can take 500ms - 5000ms)│
-│ 3. Commit DB Transaction        │        │                             │
-└─────────────────────────────────┘        └──────────────┬──────────────┘
-                                                          │
-          ┌───────────────────────────────────────────────┴───────────────┐
-          ▼                                                               ▼
-   ON SUCCESS:                                                     ON FAILURE / TIMEOUT:
-┌─────────────────────────────────┐        ┌─────────────────────────────┐
-│ 5. UPDATE call status INITIATED │        │ 5. Compensation Transaction:│
-│ 6. Store provider_call_id       │        │    - Agent -> AVAILABLE     │
-│                                 │        │    - Call -> FAILED         │
-│                                 │        │    - Borrower attempt + 1   │
-└─────────────────────────────────┘        └─────────────────────────────┘
-```
-
----
-
-## Three-Layer Event Ingestion Pipeline
-
-Telecom carriers deliver webhook notifications asynchronously over public networks. Webhooks are frequently **duplicated**, **reordered**, or **delayed**.
-
-SmartDialer pipes all incoming events through three sequential defensive barriers:
-
-```
-Provider Webhook
-       │
-       ▼
-┌────────────────────────────────────────────────────────┐
-│ Layer 1: Idempotency Guard                             │
-│ Check `processed_events` table for `event_id`.         │
-│ If already present: Return HTTP 200 { status: 'noop' } │
-└──────────────────────────┬─────────────────────────────┘
-                           │ (New Event)
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│ Layer 2: Sequence Ordering Guard                       │
-│ Check `sequence_number` against current `call.seq`.    │
-│ If `sequence_number < current_seq`: Log & Discard.     │
-└──────────────────────────┬─────────────────────────────┘
-                           │ (In-Order Event)
-                           ▼
-┌────────────────────────────────────────────────────────┐
-│ Layer 3: Finite State Machine Validation               │
-│ Check `CallFSM.canTransition(current, next)`.          │
-│ If invalid: Reject. If valid: Apply atomic mutation.   │
-└────────────────────────────────────────────────────────┘
-```
-
----
-
-## Self-Healing & Resilience Subsystems
-
-### 1. Stale Reservation Recovery (Lease Reaper)
-- When an agent is allocated, a lease timestamp is stamped (`reservation_expires_at = NOW() + 30s`).
-- If a background worker crashes before executing the telecom RPC, the agent is trapped in `RESERVED`.
-- A background lease reaper runs periodically:
-  ```sql
-  SELECT * FROM agents 
-  WHERE status = 'RESERVED' 
-    AND reservation_expires_at < datetime('now');
-  ```
-- It cancels the orphaned reservation, marks the phantom call `FAILED`, and resets the agent to `AVAILABLE`.
-
-### 2. Provider Outage Circuit Breaker
-- Tracks consecutive provider timeouts and HTTP 5xx responses using `ProviderHealthRepository`.
-- **Threshold**: 5 consecutive failures triggers state change `HEALTHY` $\to$ `DEGRADED` $\to$ `TRIPPED`.
-- In `TRIPPED` state:
-  - Safety Controller vetoes 100% of new dial requests.
-  - Periodic single-call probe tests the provider.
-  - Once 3 consecutive probe calls succeed, the circuit resets to `HEALTHY`.
-
----
-
-## Finite State Machines (FSM)
-
-### Agent State Machine
-
-```
-   ┌──────────┐
-   │ OFFLINE  │◄────────────────────────────────────────┐
-   └────┬─────┘                                         │
-        │ login                                         │
-        ▼                                               │
-   ┌──────────┐      reserve       ┌──────────┐         │
-   │AVAILABLE │───────────────────►│ RESERVED │         │
-   └────▲─────┘                    └────┬─────┘         │
-        │                               │ dial          │
-        │ wrap-up complete              ▼               │ disconnect/
-        │                          ┌──────────┐         │ failure
-   ┌────┴─────┐                    │ DIALING  │         │
-   │ WRAP_UP  │                    └────┬─────┘         │
-   └────▲─────┘                         │ answer        │
-        │                               ▼               │
-        │ hangup                   ┌──────────┐         │
-        └──────────────────────────│CONNECTED │─────────┘
-                                   └──────────┘
-```
-
-| From State | Allowed Transitions | Trigger |
-|---|---|---|
-| `OFFLINE` | `AVAILABLE` | Agent logs in / sets active |
-| `AVAILABLE` | `RESERVED`, `PAUSED`, `OFFLINE` | Dialer reserves agent or agent pauses |
-| `RESERVED` | `DIALING`, `AVAILABLE` | Call initiated or allocation cancelled/rolled back |
-| `DIALING` | `CONNECTED`, `AVAILABLE`, `WRAP_UP` | Customer answers, or call fails/busy/no-answer |
-| `CONNECTED` | `WRAP_UP`, `AVAILABLE` | Call disconnects |
-| `WRAP_UP` | `AVAILABLE`, `PAUSED`, `OFFLINE` | Agent completes wrap-up notes |
-| `PAUSED` | `AVAILABLE`, `OFFLINE` | Agent unpauses |
-
-### Call State Machine
-
-| Current State | Next Allowed States | Terminal? | Notes |
-|---|---|---|---|
-| `QUEUED` | `RESERVED`, `CANCELLED` | No | Borrower selected for dialing |
-| `RESERVED` | `INITIATED`, `FAILED`, `CANCELLED` | No | Agent paired, preparing provider RPC |
-| `INITIATED` | `RINGING`, `FAILED`, `CANCELLED` | No | Provider accepted call |
-| `RINGING` | `ANSWERED`, `FAILED`, `CANCELLED` | No | Customer phone is ringing |
-| `ANSWERED` | `CONNECTED`, `FAILED` | No | Customer picked up |
-| `CONNECTED` | `COMPLETED`, `FAILED` | No | Media bridge established with agent |
-| `COMPLETED` | *(None)* | **Yes** | Call completed normally |
-| `FAILED` | *(None)* | **Yes** | Busy, unanswered, network failure, or timeout |
-| `CANCELLED` | *(None)* | **Yes** | Abandoned or cancelled by operator |
-
----
-
-## REST API Documentation
-
-### 1. Health & Status
-```http
-GET /health
-```
-```json
-{
-  "status": "ok",
-  "service": "smart-dialer",
-  "timestamp": "2026-09-04T13:15:39.292Z",
-  "pacingMode": "progressive"
-}
-```
-
-### 2. Create Campaign
-```http
-POST /api/campaigns
-Content-Type: application/json
-
-{
-  "name": "Q3 Debt Collection",
-  "mode": "predictive"
-}
-```
-
-### 3. Register Agents in Bulk
-```http
-POST /api/campaigns/:campaignId/agents
-Content-Type: application/json
-
-{
-  "count": 20,
-  "state": "AVAILABLE"
-}
-```
-
-### 4. Import Borrowers
-```http
-POST /api/campaigns/:campaignId/borrowers
-Content-Type: application/json
-
-{
-  "borrowers": [
-    { "name": "John Doe", "phoneNumber": "+15551234567", "priority": 10 },
-    { "name": "Jane Smith", "phoneNumber": "+15559876543", "priority": 5 }
-  ]
-}
-```
-
-### 5. Trigger Pacing Tick Manually
-```http
-POST /api/campaigns/:campaignId/tick
-```
-```json
-{
-  "tick": 1,
-  "mode": "predictive",
-  "allocatedCalls": 5,
-  "successfulInitiations": 5,
-  "failedInitiations": 0
-}
-```
-
-### 6. Carrier Telecom Webhook Ingestion
-```http
-POST /api/dialer/events
-Content-Type: application/json
-
-{
-  "eventId": "evt-98234-abcd",
-  "providerCallId": "rel-4607beb5",
-  "eventType": "ANSWERED",
-  "sequenceNumber": 3,
-  "timestamp": "2026-09-04T13:17:19.865Z"
-}
-```
-
-### 7. Real-Time Campaign Metrics
-```http
-GET /api/campaigns/:campaignId/metrics
-```
-```json
-{
-  "campaignId": "cfec974e-3894-4ba1-aa0e-64a0571b0ea8",
-  "status": "active",
-  "pacingMode": "predictive",
-  "agents": {
-    "total": 20,
-    "breakdown": {
-      "AVAILABLE": 14,
-      "CONNECTED": 5,
-      "WRAP_UP": 1,
-      "RESERVED": 0,
-      "DIALING": 0,
-      "OFFLINE": 0,
-      "PAUSED": 0
-    }
-  },
-  "calls": {
-    "total": 120,
-    "completed": 45,
-    "failed": 75,
-    "abandonmentRate": "0.8%"
-  }
-}
-```
-
----
-
-## Simulation & Benchmarks (Scenarios A–D)
-
-SmartDialer includes a deterministic multi-tick discrete-event simulator verifying invariant adherence under edge cases.
-
-To run all scenarios side-by-side:
-```bash
-npm run simulate
-```
-
-### Scenario Matrix
-
-| Scenario | Agents | Borrowers | Answer Rate | Provider Profile | Key Tested Capability |
-|---|---|---|---|---|---|
-| **Scenario A: Low Answer Rate** | 20 | 100 | 20% | Reliable | Predictive pacing maintains high agent utilization despite 80% customer no-answer rate. |
-| **Scenario B: Typical Collections** | 25 | 150 | 50% | Reliable | Stable equilibrium: high throughput with $\le 1\%$ abandonment. |
-| **Scenario C: High Answer Rate** | 20 | 100 | 70% | Reliable | **Safety Stress Test**: Safety Controller clamps overdialing to prevent abandoned calls. |
-| **Scenario D: Outage & Degraded Network** | 50 | 250 | 45% | Unreliable (5% err, timeouts) | Webhook deduplication, stale recovery, and circuit breaker degradation under stress. |
-
-#### Example Head-to-Head Comparison (Scenario A)
-
-```
-================================================================================
-SCENARIO A: Progressive vs. Predictive Comparison
-================================================================================
-Metric                      Progressive         Predictive          Delta
---------------------------------------------------------------------------------
-Duration                    15 ticks            15 ticks            —
-Completed Calls             21                  28                  +33.3%
-Agent Idle Time             72.4%               38.1%               -34.3%
-Agent Utilization           27.6%               61.9%               +124.3%
-Abandoned Calls             0 (0.0%)            0 (0.0%)            Preserved
-Invariants Passed           100%                100%                PERFECT
-================================================================================
-```
-
----
-
-## Performance & Load Testing
-
-Benchmark suite (`npm run loadtest`) validates pacing decision latency, SQL throughput, and lock conflict rates across increasing agent tiers:
-
-| Scale Tier | Setup Latency | Pacing Decision p50 | Pacing Decision p99 | Throughput | Conflict Rate |
-|---|---|---|---|---|---|
-| **100 Agents** | 3ms | 0.13ms | 0.57ms | **3,800+ ops/sec** | 0.0% |
-| **1,000 Agents** | 6ms | 0.35ms | 0.47ms | **580+ ops/sec** | 0.0% |
-| **10,000 Agents** | 50ms | 2.78ms | 4.06ms | **55+ ops/sec** | 0.0% |
-
-- **Sub-millisecond decisions**: Pacing calculations for 1,000 agents execute in under $0.5\text{ms}$.
-- **Zero Deadlocks**: Optimistic concurrency control guarantees no lock contention or deadlocks.
-
----
-
-## Getting Started & Installation
+## 9. Getting Started
 
 ### Prerequisites
-- **Node.js**: v22.0.0 or newer (tested on Node.js v24.14.0)
-- **npm**: v10.0.0 or newer
+
+- Node.js 22+ (uses built-in `node:sqlite` module)
 
 ### Installation
 
 ```bash
-# 1. Clone repository
-git clone <repository-url>
-cd SmartDialer
-
-# 2. Install dependencies
 npm install
-
-# 3. Verify TypeScript type safety
-npm run typecheck
-
-# 4. Run the complete test suite (218 tests)
-npm test
 ```
 
-### Running the System
+### Running the Server
 
 ```bash
-# Start the production REST API server (port 3000)
-npm start
+npm run dev    # Development mode with hot reload
+npm run start   # Production mode
+```
 
-# Run the 4-scenario benchmark simulation
-npm run simulate
+The server starts on `http://localhost:3000`. The web UI is available at the same address.
 
-# Run the 100 / 1,000 / 10,000 agent load test
-npm run loadtest
+### Running Tests
+
+```bash
+npm test                    # All tests
+npm run test:unit          # Unit tests (state machines)
+npm run test:integration   # Integration tests
+npm run test:concurrency   # Concurrency safety tests
+```
+
+### Running Simulations
+
+```bash
+npm run simulate   # Run all benchmark scenarios
+npm run loadtest   # Run load tests
+```
+
+### Building
+
+```bash
+npm run build   # Compile TypeScript to dist/
 ```
 
 ---
 
-## Documentation Directory
+## 10. API Reference
 
-For deep dives into specific architectural topics, see the `/docs` folder:
+### Campaigns
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/campaigns` | Create a new campaign |
+| GET | `/api/campaigns` | List all campaigns |
+| GET | `/api/campaigns/:id` | Get campaign details |
+| PATCH | `/api/campaigns/:id/status` | Update campaign status |
 
-- **[Architecture & Design Details](docs/ARCHITECTURE.md)**: Deep dive into schema, caching, state machines, and scaling boundaries.
-- **[Architecture Decision Records (ADRs)](docs/ADR.md)**: Records on Node.js/SQLite selection, OCC vs Pessimistic locking, and event sequencing.
-- **[Interview Q&A & Technical Deep-Dive](docs/INTERVIEW_PREPARATION.md)**: 30+ comprehensive questions and answers covering every edge case.
-- **[Technical Hiring Design Answer](docs/FINAL_DESIGN_ANSWER.md)**: Formal written submission matching the hiring assignment prompt.
-- **[5-Minute Interactive Demo Script](docs/DEMO_SCRIPT.md)**: Live step-by-step curl guide for evaluators.
+### Agents
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/campaigns/:campaignId/agents` | Create agent(s) |
+| GET | `/api/campaigns/:campaignId/agents` | List agents for a campaign |
+| GET | `/api/agents/:id` | Get agent details |
+| PATCH | `/api/agents/:id/state` | Transition agent state |
+| POST | `/api/agents/:id/heartbeat` | Record agent heartbeat |
 
----
+### Borrowers
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/campaigns/:campaignId/borrowers` | Add borrower(s) |
+| GET | `/api/campaigns/:campaignId/borrowers` | List borrowers (filter by status) |
+| GET | `/api/borrowers/:id` | Get borrower details |
 
-## License
+### Dialer
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/campaigns/:campaignId/tick` | Run a dialer tick |
+| POST | `/api/events` | Process a provider event |
+| GET | `/api/campaigns/:campaignId/calls` | List calls for a campaign |
 
-MIT License. Developed as a production-grade functional prototype for technical evaluation.
+### Metrics
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/campaigns/:campaignId/metrics` | Get campaign metrics |
+| GET | `/api/providers/health` | Get provider health |
+| POST | `/api/recovery/stale` | Run stale reservation recovery |
+
+### Simulation
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/simulation/scenarios` | List benchmark scenarios |
+| POST | `/api/simulation/scenarios/:id/run` | Run a specific scenario |
+| POST | `/api/simulation/run` | Run custom simulation |
+
+### Health
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | System health check |
