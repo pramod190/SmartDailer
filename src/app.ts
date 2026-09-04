@@ -60,16 +60,6 @@ export function createApp(deps: AppDependencies = {}): express.Application {
   app.use('/api/simulation', createSimulationRouter(db));
   app.use('/api', createMetricsRouter(db, config));
 
-  // --- Download project zip ---
-  app.get('/download', (_req, res) => {
-    const zipPath = '/tmp/cc-agent/70637993/project.zip';
-    res.download(zipPath, 'smart-dialer.zip', (err) => {
-      if (err) {
-        res.status(404).json({ error: 'Download not available' });
-      }
-    });
-  });
-
   // --- Static Frontend ---
   const publicDir = path.resolve(__dirname, '..', 'public');
   app.use(express.static(publicDir));
