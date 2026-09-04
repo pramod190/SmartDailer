@@ -1,0 +1,39 @@
+{
+  "name": "smart-dialer",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "SmartDialer — Predictive dialing with deterministic safety characteristics",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:concurrency": "vitest run --reporter=verbose tests/concurrency/",
+    "test:safety": "vitest run --reporter=verbose tests/safety/",
+    "test:failure": "vitest run --reporter=verbose tests/failure/",
+    "test:unit": "vitest run --reporter=verbose tests/unit/",
+    "test:integration": "vitest run --reporter=verbose tests/integration/",
+    "test:e2e": "vitest run --reporter=verbose tests/e2e/",
+    "simulate": "tsx src/simulation/run.ts",
+    "loadtest": "tsx src/loadtest/run.ts",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": ["dialer", "predictive", "progressive", "telecom", "pacing"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.21.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
